@@ -1,7 +1,6 @@
 // solana-vanity-address-generator.js
 const crypto = require('crypto');
 const { PublicKey, Keypair } = require('@solana/web3.js');
-const nacl = require('tweetnacl');
 const bs58 = require('bs58');
 const os = require('os');
 const cluster = require('cluster');
@@ -12,87 +11,66 @@ const path = require('path');
 try {
   require('@solana/web3.js');
   require('bs58');
-  require('tweetnacl');
 } catch (err) {
   console.error('Required packages not found. Please install them using:');
-  console.error('npm install @solana/web3.js bs58 tweetnacl');
+  console.error('npm install @solana/web3.js bs58');
   process.exit(1);
 }
 
-// Generate keypair directly using tweetnacl for better performance
-function generateFastKeypair() {
-  const secretKey = nacl.sign.keyPair().secretKey;
-  return {
-    publicKey: new PublicKey(secretKey.slice(32, 64)),
-    secretKey: secretKey
-  };
-}
-
 // Main function for worker processes
-function startWorker(searchPatterns) {
-  const searchPatternsLower = searchPatterns.map(pattern => pattern.toLowerCase());
+function startWorker(searchPattern) {
+  const searchTextLower = searchPattern.toLowerCase();
   let count = 0;
   let lastReported = 0;
   
-  console.log(`[Worker ${process.pid}] Started searching for patterns: ${searchPatterns.join(', ')}`);
+  console.log(`[Worker ${process.pid}] Started searching for "${searchPattern}"`);
   
   // Main search loop
   while (true) {
-    // Generate new keypairs in batches for better performance
-    for (let i = 0; i < 250; i++) {
-      // Generate a new keypair
-      const keypair = generateFastKeypair();
+    // Generate a new keypair
+    const keypair = Keypair.generate();
+    
+    // Get the public key address in base58
+    const publicKey = keypair.publicKey.toString();
+    
+    // Check if the address contains the search pattern (case insensitive)
+    if (publicKey.toLowerCase().includes(searchTextLower)) {
+      // Extract private key
+      const privateKeyBytes = keypair.secretKey.slice(0, 32);
+      const privateKey = bs58.encode(privateKeyBytes);
       
-      // Get the public key address in base58
-      const publicKey = keypair.publicKey.toString();
+      // Report the match
+      process.send({
+        type: 'match',
+        publicKey,
+        privateKey,
+        count
+      });
       
-      // Convert to lowercase once for all pattern checks
-      const publicKeyLower = publicKey.toLowerCase();
-      
-      // Check if the address contains any of the search patterns (case insensitive)
-      for (let j = 0; j < searchPatternsLower.length; j++) {
-        const pattern = searchPatternsLower[j];
-        if (publicKeyLower.includes(pattern)) {
-          // Extract private key
-          const privateKeyBytes = keypair.secretKey.slice(0, 32);
-          const privateKey = bs58.encode(privateKeyBytes);
-          
-          // Report the match
-          process.send({
-            type: 'match',
-            publicKey,
-            privateKey,
-            pattern: searchPatterns[j],
-            count: i
-          });
-          
-          // No need to check other patterns for this address
-          break;
-        }
-      }
+      // Continue searching for more matches
     }
     
-    count += 250;
+    count++;
     
-    // Report progress every 10000 addresses
-    if (count - lastReported >= 10000) {
-      process.send({ type: 'progress', count: 10000 });
+    // Report progress every 1000 addresses
+    if (count - lastReported >= 1000) {
+      process.send({ type: 'progress', count });
       lastReported = count;
     }
   }
 }
 
 // Save match to text file
-function saveMatchToFile(match) {
+function saveMatchToFile(match, searchText) {
   const now = new Date();
   const timestamp = now.toISOString().replace(/[:.]/g, '-');
-  const filename = `solana-${match.pattern}-${timestamp}.txt`;
+  const filename = `solana-${searchText}-${timestamp}.txt`;
   
   const data = `
 ===============================================
 Solana Vanity Address Match
 ===============================================
-Search Pattern: ${match.pattern}
+Search Text: ${searchText}
 Found At: ${now.toLocaleString()}
 -----------------------------------------------
 Public Address: ${match.publicKey}
@@ -104,19 +82,14 @@ Private Key: ${match.privateKey}
   return filename;
 }
 
-// Format large numbers with commas
-function formatNumber(num) {
-  return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-}
-
 // Main function for primary process
 function main() {
   if (cluster.isPrimary) {
     // Get the search text from command line arguments
-    const searchPatterns = process.argv.slice(2);
-    if (searchPatterns.length === 0) {
-      console.error('Please provide at least one search pattern as a command line argument');
-      console.error('Example: node solana-vanity-address-generator.js lava moon crypto');
+    const searchText = process.argv[2];
+    if (!searchText) {
+      console.error('Please provide a search pattern as a command line argument');
+      console.error('Example: node solana-vanity-address-generator.js lava');
       process.exit(1);
     }
     
@@ -128,7 +101,6 @@ function main() {
     let totalChecked = 0;
     const startTime = Date.now();
     let matchesFound = 0;
-    let lastProgressUpdate = Date.now();
     
     // Create results directory if it doesn't exist
     const resultsDir = 'results';
@@ -144,58 +116,44 @@ function main() {
       worker.on('message', (msg) => {
         if (msg.type === 'progress') {
           totalChecked += msg.count;
-          const currentTime = Date.now();
-          
-          // Only update console every second to avoid excessive printing
-          if (currentTime - lastProgressUpdate >= 1000) {
-            const elapsedSeconds = (currentTime - startTime) / 1000;
-            const addressesPerSecond = Math.floor(totalChecked / elapsedSeconds);
-            
-            // Clear the previous line and print the new progress
-            process.stdout.write(`\rTotal addresses checked: ${formatNumber(totalChecked)} (${formatNumber(addressesPerSecond)}/sec)`);
-            
-            lastProgressUpdate = currentTime;
-          }
+          const elapsedSeconds = (Date.now() - startTime) / 1000;
+          const addressesPerSecond = Math.floor(totalChecked / elapsedSeconds);
+          console.log(`Checked ${totalChecked.toLocaleString()} addresses (${addressesPerSecond.toLocaleString()}/sec)`);
         } 
         else if (msg.type === 'match') {
           matchesFound++;
           // Save match to a text file
-          const filename = saveMatchToFile(msg);
-          
-          // Print a newline to avoid overwriting the progress message
-          console.log('');
+          const filename = saveMatchToFile(msg, searchText);
           
           console.log('\x1b[32m%s\x1b[0m', `\n=== MATCH FOUND (#${matchesFound}) ===`);
-          console.log(`Pattern Matched: ${msg.pattern}`);
           console.log(`Public Address: ${msg.publicKey}`);
           console.log(`Private Key: ${msg.privateKey}`);
-          console.log(`Found after checking ${formatNumber(totalChecked)} addresses`);
+          console.log(`Found after checking ${(totalChecked + msg.count).toLocaleString()} addresses`);
           console.log(`Saved to file: ${filename}`);
           const elapsedSeconds = (Date.now() - startTime) / 1000;
           console.log(`Time elapsed: ${elapsedSeconds.toFixed(2)} seconds\n`);
         }
       });
       
-      // Send search patterns to worker
-      worker.send(searchPatterns);
+      // Send search pattern to worker
+      worker.send(searchText);
     }
     
     // Handle worker messages
     cluster.on('message', (worker, message) => {
       if (message === 'ready') {
-        worker.send(searchPatterns);
+        worker.send(searchText);
       }
     });
     
-    console.log(`Searching for Solana addresses containing any of: "${searchPatterns.join('", "')}"`);
-    console.log('All searches are case-insensitive');
+    console.log(`Searching for Solana addresses containing "${searchText}" (case-insensitive)`);
     console.log('Press Ctrl+C to stop the search at any time\n');
     console.log('Matches will be saved to text files in the current directory\n');
     
   } else {
     // This is a worker process
-    process.on('message', (searchPatterns) => {
-      startWorker(searchPatterns);
+    process.on('message', (searchText) => {
+      startWorker(searchText);
     });
     
     // Tell the primary we're ready
